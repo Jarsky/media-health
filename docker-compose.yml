@@ -1,0 +1,32 @@
+# media-health: one container that runs the scheduler and is your shell for scans.
+#   docker compose up -d --build                 # first time / after an update
+#   docker exec -it media-health bash            # then: media-health  |  media-health -h  |  m<Tab>
+#   docker exec -it media-health media-health    # straight into the menu
+#   docker logs -f media-health                  # scheduler + background/scheduled scan output
+# Settings live in .env (copy .env.example). NVIDIA GPU: see docker-compose.gpu.yml.
+services:
+  media-health:
+    build:
+      context: .
+      args:
+        PUID: ${PUID:-1000}
+        PGID: ${PGID:-1000}
+    image: media-health:local
+    container_name: media-health
+    user: "${PUID:-1000}:${PGID:-1000}"
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 2m        # lets a running scheduled scan finish its current files
+    mem_limit: ${MEM_LIMIT:-2g}
+    memswap_limit: ${MEM_LIMIT:-2g}
+    cpus: ${CPUS:-4}
+    network_mode: none           # it never needs the network
+    tty: true
+    stdin_open: true
+    environment:
+      - TZ=${TZ:-Etc/UTC}
+      - TERM=xterm-256color
+      - COLORTERM=truecolor
+    volumes:
+      - ${MEDIA_PATH:?set MEDIA_PATH in .env}:/media:ro
+      - ./reports:/reports

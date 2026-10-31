@@ -1,0 +1,36 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e '.[dev]'
+      - run: ruff check .
+      - run: pytest -q
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t media-health:ci .
+      - name: Smoke test (help, completion, a quick scan of a generated clip)
+        run: |
+          mkdir -p media reports && chmod 777 media reports
+          docker run --rm -v "$PWD/media:/media" --entrypoint ffmpeg media-health:ci \
+            -v error -f lavfi -i testsrc2=s=1280x720:d=3 -c:v libx264 -pix_fmt yuv420p /media/Test.2026.720p.x264.mkv
+          docker run --rm media-health:ci --version
+          docker run --rm media-health:ci --completion | grep -q _media_health
+          docker run --rm -v "$PWD/media:/media:ro" -v "$PWD/reports:/reports" media-health:ci /media --plain
+          test -s reports/latest.csv

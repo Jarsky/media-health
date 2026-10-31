@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "media-health"
+dynamic = ["version"]
+description = "Find damaged, broken or mislabelled files in a media library"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = ["rich==13.9.4", "pyfiglet==1.0.2"]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+media-health = "media_health:main"
+
+[tool.setuptools]
+py-modules = ["media_health"]
+
+[tool.setuptools.dynamic]
+version = { attr = "media_health.VERSION" }
+
+[tool.ruff]
+line-length = 130
+
+[tool.ruff.lint]
+select = ["E", "F", "B", "W"]
+# grouped imports and one-line `if x: y` / `a; b` keep the check code compact; long rich markup lines are fine
+ignore = ["E401", "E701", "E702", "E731", "E501", "E741"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
