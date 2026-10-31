@@ -1,3 +1,4 @@
+import argparse
 import datetime as dt
 import io
 import json
@@ -151,3 +152,68 @@ def test_stale_status_is_not_running(tmp_path, monkeypatch):
     mh.write_status(str(tmp_path), _stats(), 1)
     monkeypatch.setattr(mh.time, "time", lambda: 1e12)
     assert mh.running_scan(str(tmp_path)) is None
+
+
+SD8 = {"res": "1920x1080", "pix_fmt": "yuv420p", "hdr": "", "dv_profile": "", "vcodec": "hevc",
+       "audio": "truehd:,ac3:", "bitrate_mbps": 9}
+
+
+@pytest.mark.parametrize("name, r, want", [
+    # fake UHD: resolution corrected; UHD, 10bit and HDR dropped (no "8bit"/"SDR" added); main audio replaced,
+    # channel layout kept, secondary AC3 track not added
+    ("Sintel.2010.2160p.UHD.BluRay.x265.10bit.HDR.DTS-HD.MA.5.1-GROUP.mkv", SD8,
+     "Sintel.2010.1080p.BluRay.x265.TrueHD.5.1-GROUP.mkv"),
+    # wrong video codec replaced
+    ("Big.Buck.Bunny.2008.1080p.BluRay.REMUX.AVC.DTS-HD.MA.5.1-GRP.mkv",
+     dict(SD8, vcodec="vc1", audio="dts:DTS-HD MA,ac3:", bitrate_mbps=30),
+     "Big.Buck.Bunny.2008.1080p.BluRay.REMUX.VC-1.DTS-HD.MA.5.1-GRP.mkv"),
+    # missing DV and Atmos dropped, TrueHD -> the DTS-HD MA that's really there; spaces kept as spaces
+    ("Tears of Steel 2012 2160p UHD BluRay HDR DV x265 TrueHD 7.1 Atmos-GROUP.mkv",
+     dict(SD8, res="3840x2160", pix_fmt="yuv420p10le", hdr="HDR10", audio="dts:DTS-HD MA", bitrate_mbps=40),
+     "Tears of Steel 2012 2160p UHD BluRay HDR x265 DTS-HD MA 7.1-GROUP.mkv"),
+    # " - " in a title is left alone
+    ("Spider-Man - Into the Spider-Verse (2018) 720p WEB-DL DDP5.1 x264.mkv", dict(SD8, vcodec="h264", audio="eac3:"),
+     "Spider-Man - Into the Spider-Verse (2018) 1080p WEB-DL DDP5.1 x264.mkv"),
+    # REMUX that's an encode loses REMUX
+    ("Agent.327.2017.1080p.BluRay.REMUX.x264.DD.5.1.mkv", dict(SD8, vcodec="h264", audio="ac3:", bitrate_mbps=6),
+     "Agent.327.2017.1080p.BluRay.x264.DD.5.1.mkv"),
+])
+def test_suggest_name(name, r, want):
+    got = mh.suggest_name("/m/" + name, r)
+    assert got == want
+    assert mh.name_issues("/m/" + got, r) == []
+
+
+def test_suggest_name_nothing_to_fix():
+    assert mh.suggest_name("/m/Film.2016.2160p.UHD.BluRay.REMUX.HDR.HEVC.TrueHD.7.1.mkv", UHD) is None
+
+
+def test_parse_only():
+    assert mh.parse_only("bad, WARN") == ["bad", "warn"]
+    for bad in ("", "ok", "bad,nope"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            mh.parse_only(bad)
+
+
+def test_flagged(tmp_path):
+    db = mh.DB(str(tmp_path / "t.db"))
+    for p, st, ni in [("/media/movies/a.mkv", "BAD", []), ("/media/movies/b.mkv", "WARN", ["x"]),
+                      ("/media/movies/c.mkv", "OK", []), ("/media/tv/d.mkv", "BAD", []),
+                      ("/media/movies2/e.mkv", "BAD", [])]:
+        db.save({"path": p, "size": 1, "mtime": 1, "mode": "quick", "status": st, "name_issues": ni})
+    db.commit()
+    assert mh.flagged(db, ["bad"], ["/media/movies"]) == ["/media/movies/a.mkv"]
+    assert mh.flagged(db, ["bad", "mislabelled"], ["/media/movies/"]) == ["/media/movies/a.mkv", "/media/movies/b.mkv"]
+    assert mh.flagged(db, ["bad"], ["/media/tv/d.mkv"]) == ["/media/tv/d.mkv"]
+
+
+def test_decoder_label(monkeypatch):
+    p = mh.build_parser()
+    monkeypatch.setitem(mh._GPU, "ok", True)
+    assert mh.decoder_label(p.parse_args(["/m"])) == "cpu+gpu"
+    assert mh.decoder_label(p.parse_args(["/m", "--full"])) == "cpu"
+    assert mh.decoder_label(p.parse_args(["/m", "--gpu", "on"])) == "gpu"
+    assert mh.decoder_label(p.parse_args(["/m", "--quick"])) == "none"
+    monkeypatch.setitem(mh._GPU, "ok", False)
+    assert mh.decoder_label(p.parse_args(["/m"])) == "cpu (no GPU)"
+    assert mh.decoder_label(p.parse_args(["/m", "--gpu", "off"])) == "cpu"

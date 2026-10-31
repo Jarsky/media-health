@@ -20,29 +20,34 @@ def save(c, name, title):
     print("wrote", name)
 
 
+UHD = {"res": "3840x2160", "pix_fmt": "yuv420p10le", "hdr": "HDR10", "dv_profile": "", "vcodec": "hevc",
+       "audio": "truehd:,ac3:", "bitrate_mbps": 58}
+HD = dict(UHD, res="1920x1080", pix_fmt="yuv420p", hdr="", vcodec="h264", audio="eac3:", bitrate_mbps=9)
+# (path, status from the checks, problems, stream details); name issues come from the real name check
 FILMS = [
-    ("Big Buck Bunny (2008)/Big.Buck.Bunny.2008.2160p.UHD.BluRay.REMUX.HDR.HEVC.TrueHD.7.1.mkv", "OK", [], []),
+    ("Big Buck Bunny (2008)/Big.Buck.Bunny.2008.2160p.UHD.BluRay.REMUX.HDR.HEVC.TrueHD.7.1.mkv", "OK", [], UHD),
     ("Sintel (2010)/Sintel.2010.2160p.UHD.BluRay.x265.10bit.HDR.DTS-HD.MA.5.1-GROUP.mkv", "BAD",
      ["decoder stopped after 100 errors at 21m (224 MB) - stream won't decode",
-      "104 decode errors (start: [hevc @ 0x63ed] VPS 0 does not exist)"], []),
-    ("Tears of Steel (2012)/Tears.of.Steel.2012.2160p.UHD.BluRay.HDR.x265.DTS-GROUP.mkv", "WARN", [],
-     ["says UHD BluRay but video is 8-bit (yuv420p, SDR) - not a real UHD disc source", "says HDR but video is SDR"]),
+      "104 decode errors (start: [hevc @ 0x63ed] VPS 0 does not exist)"], dict(UHD, audio="dts:DTS-HD MA")),
+    ("Tears of Steel (2012)/Tears.of.Steel.2012.2160p.UHD.BluRay.HDR.x265.DTS-GROUP.mkv", "OK", [],
+     dict(UHD, pix_fmt="yuv420p", hdr="", audio="dts:")),
     ("Elephants Dream (2006)/Elephants.Dream.2006.1080p.BluRay.REMUX.AVC.LPCM.2.0.mkv", "BAD",
-     ["zeroed 1MiB blocks at [0.412, 0.471]"], []),
+     ["zeroed 1MiB blocks at [0.412, 0.471]"], dict(HD, audio="pcm_s24le:", bitrate_mbps=31)),
     ("Cosmos Laundromat (2015)/Cosmos.Laundromat.2015.1080p.WEB-DL.DDP5.1.Atmos.x264.mkv", "WARN",
-     ["7 decode errors (38m: [h264 @ 0x55d1] concealing 1200 DC, 1200 AC, 1200 MV errors in P frame)"], []),
-    ("Spring (2019)/Spring.2019.2160p.WEB-DL.DV.HDR.HEVC.DDP5.1.mkv", "OK", [], []),
-    ("Agent 327 (2017)/Agent.327.2017.720p.BluRay.x264.AAC.mkv", "WARN", [], ["says 720p but video is 1920x1080"]),
+     ["7 decode errors (38m: [h264 @ 0x55d1] concealing 1200 DC, 1200 AC, 1200 MV errors in P frame)"],
+     dict(HD, audio="eac3:Dolby Digital Plus + Dolby Atmos")),
+    ("Spring (2019)/Spring.2019.2160p.WEB-DL.DV.HDR.HEVC.DDP5.1.mkv", "OK", [], dict(UHD, dv_profile="8", audio="eac3:")),
+    ("Agent 327 (2017)/Agent.327.2017.720p.BluRay.REMUX.AVC.DTS-HD.MA.5.1.mkv", "OK", [],
+     dict(HD, vcodec="vc1", audio="truehd:,ac3:", bitrate_mbps=28)),
 ]
 
 
 def demo_db(path):
     db = mh.DB(path)
-    for p, st, probs, names in FILMS:
-        db.save({"path": f"/media/movies/{p}", "size": 30_000_000_000, "mtime": 1, "mode": "sample", "status": st,
-                 "base_status": "OK" if names and not probs else st, "problems": probs, "name_issues": names,
-                 "res": "3840x2160", "vcodec": "hevc", "hdr": "HDR10", "check_version": mh.CHECK_VERSION,
-                 "checked": "2026-11-01T02:00:00"})
+    for p, st, probs, streams in FILMS:
+        r = dict(streams, path=f"/media/movies/{p}", size=30_000_000_000, mtime=1, mode="sample", base_status=st,
+                 problems=probs, check_version=mh.CHECK_VERSION, checked="2026-11-01T02:00:00")
+        db.save(mh.apply_name_check(r, "warn"))
     for n, res, codec, hdr in [(2400, "1920x1080", "h264", ""), (1650, "3840x2160", "hevc", "HDR10"),
                                (900, "1920x1080", "hevc", ""), (310, "3840x2160", "hevc", "")]:
         for k in range(n // 50):
@@ -66,8 +71,10 @@ def dashboard():
     s.phase, s.found, s.queued, s.done, s.cached, s.reused, s.filtered = "scanning", 5449, 3712, 1288, 1720, 17, 0
     s.counts.update(OK=1261, WARN=21, BAD=6); s.mislabelled = 14; s.bytes_done = 31.4e12
     s.start = s.scan_start = time.time() - 3 * 3600 - 412
-    for p, st, probs, names in FILMS[1:5]:
-        s.recent.append((st, p, mh.first_problem({"problems": probs, "name_issues": names})))
+    for p, st, probs, streams in FILMS[1:5]:
+        r = mh.apply_name_check(dict(streams, path=p, base_status=st, problems=probs), "warn")
+        s.recent.append((r["status"], p, mh.first_problem(r)))
+    mh.DECODES.update(gpu=5152, cpu=1288)
     now = time.time()
     for i, (p, stage, info) in enumerate([
             (FILMS[0][0], "decode 3/5 @ 42m gpu", "3840x2160 hevc HDR10"),

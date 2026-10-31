@@ -25,7 +25,7 @@ import subprocess, sys, threading, time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 
-VERSION = "3.2.0"
+VERSION = "3.3.0"
 VIDEO_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".ts", ".m2ts", ".mov", ".wmv", ".mpg", ".mpeg", ".webm"}
 CHECK_VERSION = 2   # bump to invalidate cached results when the probe/zero/decode checks change
 QUICK_SINCE = 1     # oldest CHECK_VERSION whose quick results are still valid (quick checks unchanged since)
@@ -208,6 +208,8 @@ def decode(path, start, seconds, timeout, gpu=False):
         n[0] += bool(SERIOUS.search(line))
         return n[0] >= FLOOD
     rc, _, err, rss, timed_out, flooded = run(cmd, timeout, abort=flood)
+    with ACTIVE_LOCK:
+        DECODES["gpu" if gpu else "cpu"] += 1
     lines = [l for l in err.splitlines() if l.strip()]
     serious = [l for l in lines if SERIOUS.search(l)]
     other = [l for l in lines if not BENIGN.search(l) and not SERIOUS.search(l)]
@@ -215,6 +217,7 @@ def decode(path, start, seconds, timeout, gpu=False):
 
 
 _GPU = {}
+DECODES = {"cpu": 0, "gpu": 0}  # decode points run this scan, for the dashboard
 
 
 def gpu_available():
@@ -227,6 +230,16 @@ def gpu_available():
         except (OSError, subprocess.TimeoutExpired):
             _GPU["ok"] = False
     return _GPU["ok"]
+
+
+def decoder_label(args):
+    """What decodes this scan: none (quick), cpu, cpu (no GPU), cpu+gpu or gpu."""
+    if args.quick:
+        return "none"
+    pts = gpu_points(args)
+    if pts == "none" and args.gpu != "off" and not gpu_available():
+        return "cpu (no GPU)"
+    return {"none": "cpu", "after-start": "cpu+gpu", "all": "gpu"}[pts]
 
 
 def gpu_points(args):
@@ -360,6 +373,102 @@ def apply_name_check(r, mislabel):
         status = worse(status, "WARN" if mislabel == "warn" else "BAD")
     r["status"] = status
     return r
+
+
+CODEC_NAME = {"hevc": "HEVC", "h264": "H.264", "av1": "AV1", "vc1": "VC-1", "mpeg2video": "MPEG2", "mpeg4": "XviD"}
+# the main audio track = the best kind present; secondary tracks never go in the name
+AUDIO_RANK = ["truehd", "dts", "flac", "pcm", "eac3", "ac3", "aac"]
+AUDIO_NAME = {"truehd": "TrueHD", "dts": "DTS", "flac": "FLAC", "pcm": "LPCM", "eac3": "DDP", "ac3": "DD", "aac": "AAC"}
+_CH_TAIL = re.compile(r"[ ._]?[1-9][ ._][01]$")
+
+
+def _cut(name, m):
+    """Remove a matched token and one separator next to it."""
+    a, b = m.span()
+    if a > 0 and name[a - 1] in " ._-":
+        a -= 1
+    elif b < len(name) and name[b] in " ._-":
+        b += 1
+    return name[:a] + name[b:]
+
+
+def _replace(name, rx, new):
+    """Replace the first match of rx with new (None = drop it) and drop any later matches."""
+    ms = list(rx.finditer(name))
+    for m in reversed(ms[1:]):
+        name = _cut(name, m)
+    if not ms:
+        return name
+    return _cut(name, ms[0]) if new is None else name[:ms[0].start()] + new + name[ms[0].end():]
+
+
+def suggest_name(path, r):
+    """The file name with its wrong claims corrected, or None when there's nothing to fix.
+    Claims the streams don't back up are dropped (HDR, HLG, DV, 10bit, UHD on an 8-bit source, REMUX);
+    a wrong resolution, video codec or main audio format is replaced with the real one."""
+    if not name_issues(path, r):
+        return None
+    name, ext = os.path.splitext(os.path.basename(path))
+    orig = name
+    try:
+        w, h = (int(x) for x in (r.get("res") or "0x0").split("x"))
+    except ValueError:
+        return None
+    ten_bit = bool(re.search(r"10|12", r.get("pix_fmt") or ""))
+    hdr, dv = r.get("hdr") or "", r.get("dv_profile") not in ("", None)
+    vcodec = r.get("vcodec") or ""
+    sep = "." if name.count(".") > name.count(" ") else " "
+
+    claimed = next(((res, rx) for res, rx in NAME_RES if rx.search(name)), None)
+    real = 2160 if w >= 3200 or h >= 1700 else 1080 if w >= 1700 or h >= 1000 else 720 if w >= 1200 or h >= 700 \
+        else 576 if h >= 560 else 480
+    if claimed and claimed[0] != real and any(i.startswith(f"says {claimed[0]}p") for i in name_issues(path, r)):
+        name = _replace(name, claimed[1], f"{real}p")
+    if NAME_UHD_BD.search(name) and not ten_bit:
+        name = _replace(name, _tok("uhd"), None)
+    if NAME_HDR.search(name) and not (hdr == "HDR10" or dv):
+        name = _replace(name, NAME_HDR, "HLG" if hdr == "HLG" and not NAME_HLG.search(name) else None)
+    if NAME_HLG.search(name) and hdr != "HLG":
+        name = _replace(name, NAME_HLG, "HDR" if hdr == "HDR10" and not NAME_HDR.search(name) else None)
+    if NAME_DV.search(name) and not dv:
+        name = _replace(name, NAME_DV, None)
+    if NAME_10BIT.search(name) and not ten_bit:
+        name = _replace(name, NAME_10BIT, None)
+    said = next(((c, rx) for c, rx in NAME_VCODEC if rx.search(name)), None)
+    if said and vcodec and said[0] != vcodec:
+        name = _replace(name, said[1], CODEC_NAME.get(vcodec, vcodec.upper()))
+    if NAME_REMUX.search(name):
+        br = r.get("bitrate_mbps") or 0
+        floor = 25 if real == 2160 else 12 if real == 1080 else 0
+        if NAME_ENCODER.search(name) or (floor and br and br < floor):
+            name = _replace(name, NAME_REMUX, None)
+
+    fam = audio_families(r.get("audio"))
+    main = next((f for f in AUDIO_RANK if f in fam), None)
+    if main:
+        audio = (r.get("audio") or "").lower()
+        new = AUDIO_NAME[main]
+        if main == "dts" and "dts-hd ma" in audio:
+            new = f"DTS-HD{sep}MA"
+        elif main == "dts" and "dts:x" in audio.replace(" ", ""):
+            new = "DTS-X"
+        placed = any(rx.search(name) for f, rx in NAME_AUDIO if f == main)
+        for f, rx in NAME_AUDIO:
+            m = rx.search(name)
+            if not m:
+                continue
+            ok = (bool(fam & {"truehd", "eac3", "atmos"}) if f == "atmos" else "dts" in fam if f == "dtsx"
+                  else bool(fam & {"ac3", "eac3"}) if f == "ac3" else f in fam)
+            if ok:
+                continue
+            if f == "atmos" or placed:
+                name = _replace(name, rx, None)
+            else:
+                ch = _CH_TAIL.search(m.group(0))
+                name = name[:m.start()] + new + (ch.group(0) if ch else "") + name[m.end():]
+                placed = True
+    name = name.strip(" ._-")
+    return name + ext if name != orig else None
 
 
 def check(path, args):
@@ -586,6 +695,26 @@ def parse_age(text):
     return float(m.group(1)) * AGE_UNITS[m.group(2)]
 
 
+ONLY = {"bad": "status='BAD'", "warn": "status='WARN'", "mislabelled": "name_issues != '[]'"}
+
+
+def parse_only(text):
+    """'bad,warn' -> ['bad', 'warn']"""
+    kinds = [k.strip().lower() for k in (text or "").split(",") if k.strip()]
+    bad = [k for k in kinds if k not in ONLY]
+    if not kinds or bad:
+        raise argparse.ArgumentTypeError(f"--only takes {', '.join(ONLY)} (comma-separated), got {text!r}")
+    return kinds
+
+
+def flagged(db, kinds, roots):
+    """Paths of files the database flags as any of kinds, under roots."""
+    scope = " OR ".join(["path = ? OR path LIKE ?"] * len(roots))
+    params = [x for r in roots for x in (r.rstrip("/"), r.rstrip("/") + "/%")]
+    where = f"({' OR '.join(ONLY[k] for k in kinds)}) AND ({scope})"
+    return [r["path"] for r in db.conn().execute(f"SELECT path FROM files WHERE {where} ORDER BY path", params)]
+
+
 def name_matcher(pattern):
     """Case-insensitive glob on the full path; plain text means 'contains'."""
     if not pattern:
@@ -622,11 +751,18 @@ class Stats:
         self.recent = deque(maxlen=8)   # (status, path, first problem)
         self.report = ""
         self.stopping = False
-        self.decoder = "none" if args.quick else {"none": "cpu", "after-start": "cpu+gpu", "all": "gpu"}[gpu_points(args)]
+        self.decoder = decoder_label(args)
+        self._decodes = None
         self._workers = None            # set on a snapshot loaded by a watching terminal
 
     SNAP = ("mode", "phase", "found", "cached", "queued", "done", "reused", "filtered", "mislabelled", "counts",
             "bytes_done", "start", "scan_start", "report", "stopping", "decoder")
+
+    def decodes(self):
+        if self._decodes is not None:
+            return self._decodes
+        with ACTIVE_LOCK:
+            return dict(DECODES)
 
     def workers(self):
         if self._workers is not None:
@@ -638,7 +774,7 @@ class Stats:
         """Everything the dashboard shows, as JSON-able data for terminals that watch this scan."""
         a = self.args
         return {**{k: getattr(self, k) for k in self.SNAP}, "recent": list(self.recent), "workers": self.workers(),
-                "args": {"paths": a.paths, "workers": a.workers, "reports": a.reports}}
+                "decodes": self.decodes(), "args": {"paths": a.paths, "workers": a.workers, "reports": a.reports}}
 
     @classmethod
     def from_snapshot(cls, d):
@@ -646,7 +782,7 @@ class Stats:
         for k in cls.SNAP:
             setattr(s, k, d[k])
         s.args = argparse.Namespace(**d["args"])
-        s.recent, s._workers = d["recent"], d["workers"]
+        s.recent, s._workers, s._decodes = d["recent"], d["workers"], d.get("decodes") or {"cpu": 0, "gpu": 0}
         return s
 
     def eta(self):
@@ -704,6 +840,10 @@ def banner(width, subtitle=""):
     return t
 
 
+DECODER_TAG = {"none": "[grey62]none (quick)[/]", "cpu": "CPU", "cpu (no GPU)": "CPU [grey50](no GPU found)[/]",
+               "cpu+gpu": "[bold #76b900]NVDEC[/] + CPU", "gpu": "[bold #76b900]NVDEC[/]"}
+
+
 def status_tag(status):
     return {"BAD": "[bold red]BAD[/]", "WARN": "[bold yellow]WARN[/]"}.get(status, "[green]OK[/]")
 
@@ -736,7 +876,8 @@ class Dashboard:
             ("OK", f"[bold green]{s.counts['OK']:,}[/]"), ("Warn", f"[bold yellow]{s.counts['WARN']:,}[/]"),
             ("Bad", f"[bold red]{s.counts['BAD']:,}[/]"), ("Mislabelled", f"[bold #ff8c42]{s.mislabelled:,}[/]"),
             ("Unchanged", f"[grey62]{s.cached:,}[/]"), ("Reused", f"[grey62]{s.reused:,}[/]"),
-            ("Filtered", f"[grey62]{s.filtered:,}[/]"),
+            ("Decoder", DECODER_TAG.get(s.decoder, s.decoder)),
+            ("GPU / CPU", f"{s.decodes()['gpu']:,} / {s.decodes()['cpu']:,}"),   # decode points run on each
             ("Data read", f"{s.bytes_done / 1e12:,.2f} TB" if s.bytes_done > 1e12 else f"{s.bytes_done / 1e9:,.1f} GB"),
             ("Elapsed", hms(el)), ("ETA", hms(s.eta())), ("Rate", f"{rate:,.1f}/min"),
         ]
@@ -848,7 +989,9 @@ def print_problems(c, rows, roots, title_extra="", limit=40, offset=0, total=Non
     for r in rows[:limit]:
         probs = [escape(p[:300]) for p in r.get("problems") or []] + \
                 [f"[#ff8c42]name:[/] {escape(x)}" for x in r.get("name_issues") or []]
-        t.add_row(status_tag(r["status"]), escape(short(r["path"], roots)), "\n".join(probs[:3]))
+        better = suggest_name(r["path"], r)
+        tip = [f"[#22d3ee]rename:[/] [white]{escape(better)}[/]"] if better else []
+        t.add_row(status_tag(r["status"]), escape(short(r["path"], roots)), "\n".join(probs[:3] + tip))
     shown = f"{offset + 1}-{offset + min(limit, len(rows))} of {total}" if total > limit or offset else f"{total}"
     c.print(Panel(t, title=f"[bold]{shown} file(s) need attention{title_extra}[/]", border_style="#ff2bd6",
                   box=box.ROUNDED))
@@ -956,6 +1099,9 @@ def build_parser():
     f.add_argument("--older-than", type=parse_age, metavar="AGE", help="only files modified more than AGE ago")
     f.add_argument("--min-gb", type=float, default=0, metavar="GB", help="only files at least this big (e.g. 15 for 4K remuxes)")
     f.add_argument("--limit", type=int, metavar="N", help="stop after queueing N files")
+    f.add_argument("--only", type=parse_only, metavar="KINDS",
+                   help="recheck only files the database already flags under PATH: bad, warn and/or mislabelled, "
+                        "comma-separated (implies --force; pair with --full to confirm suspects)")
     t = ap.add_argument_group("tuning")
     t.add_argument("--mislabel", choices=("warn", "bad", "info", "off"), default="warn",
                    help="status for files whose name doesn't match the streams (info = report only)")
@@ -974,7 +1120,8 @@ VALUE_HINTS = {"--schedule-add": ["daily 2am", "thu 3am", "mon,thu 03:30", "week
                "--newer-than": ["1d", "2d", "7d", "14d", "30d", "3mo", "6mo", "1y"],
                "--older-than": ["1d", "7d", "30d", "6mo", "1y", "2y", "5y"],
                "--workers": ["1", "2", "3", "4", "6", "8"], "--min-gb": ["1", "5", "10", "15", "30", "50"],
-               "--limit": ["10", "50", "100", "500", "1000"]}
+               "--limit": ["10", "50", "100", "500", "1000"],
+               "--only": ["bad", "warn", "mislabelled", "bad,warn", "bad,warn,mislabelled"]}
 
 
 def completion_script(parser):
@@ -1087,9 +1234,17 @@ def scan(args, argv_text="", interactive=False):
     mode = "full" if args.full else "quick" if args.quick else "sample"
     rx = re.compile(args.match, re.I) if args.match else None
     nm = name_matcher(args.name)
+    if args.only:
+        args.force = True               # the point is to check these again
+        targets = flagged(db, args.only, args.paths)
+        gone = [p for p in targets if not os.path.exists(p)]
+        db.conn().executemany("DELETE FROM files WHERE path=?", [(p,) for p in gone]); db.commit()
+        targets = [p for p in targets if p not in set(gone)]
+    with ACTIVE_LOCK:
+        DECODES.update(cpu=0, gpu=0)
     now = time.time()
     s = Stats(args, mode)
-    filtered_run = any([rx, nm, args.newer_than, args.older_than, args.min_gb, args.limit])
+    filtered_run = any([rx, nm, args.newer_than, args.older_than, args.min_gb, args.limit, args.only])
 
     def on_term(*_):
         s.stopping = True
@@ -1139,7 +1294,8 @@ def scan(args, argv_text="", interactive=False):
         phase = "scanning (still discovering)" if s.phase == "discovering" and s.queued else s.phase
         print(f"[{dt.datetime.now():%H:%M:%S}] {phase}: {s.done:,}/{s.queued:,} checked "
               f"({s.counts['OK']:,} ok, {s.counts['WARN']:,} warn, {s.counts['BAD']:,} bad, "
-              f"{s.mislabelled:,} mislabelled, {s.cached:,} unchanged, {s.reused:,} reused) ETA {hms(s.eta())}",
+              f"{s.mislabelled:,} mislabelled, {s.cached:,} unchanged, {s.reused:,} reused) ETA {hms(s.eta())}"
+              f" · decode {s.decoder} (gpu {s.decodes()['gpu']:,} / cpu {s.decodes()['cpu']:,} points)",
               flush=True)
 
     # Discovery runs in its own thread so the totals fill in quickly while workers
@@ -1150,7 +1306,7 @@ def scan(args, argv_text="", interactive=False):
 
     def discover():
         try:
-            for path in walk(args.paths):
+            for path in (walk(targets) if args.only else walk(args.paths)):
                 if s.stopping:
                     return
                 seen.add(path)
@@ -1199,7 +1355,7 @@ def scan(args, argv_text="", interactive=False):
                 print(f"{r['status']:4} {r['path']}\n     " + "\n     ".join(
                     (r.get("problems") or []) + [f"name: {x}" for x in r["name_issues"]]), flush=True)
 
-    pruned = 0
+    pruned = len(gone) if args.only else 0  # --only forgets flagged files that no longer exist
     try:
         with ThreadPoolExecutor(args.workers) as ex:
             pending = {}
@@ -1273,13 +1429,15 @@ def scan(args, argv_text="", interactive=False):
 def write_report(db, reports):
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M")
     cols = ["status", "path", "size_gb", "problems", "name_issues", "notes", "vcodec", "vprofile", "res",
-            "pix_fmt", "hdr", "dv_profile", "audio", "bitrate_mbps", "peak_rss_mb", "mode", "reused_from", "checked"]
+            "pix_fmt", "hdr", "dv_profile", "audio", "bitrate_mbps", "peak_rss_mb", "mode", "reused_from", "checked",
+            "suggested_name"]
     out = os.path.join(reports, f"media-health-{stamp}.csv")
     with open(out, "w", newline="") as f:
         w = csv.DictWriter(f, cols, extrasaction="ignore")
         w.writeheader()
         for r in db.rows(order="CASE status WHEN 'BAD' THEN 0 WHEN 'WARN' THEN 1 ELSE 2 END, path"):
-            w.writerow({**r, **{k: " ; ".join(r.get(k) or []) for k in JSON_COLS}})
+            w.writerow({**r, **{k: " ; ".join(r.get(k) or []) for k in JSON_COLS},
+                        "suggested_name": suggest_name(r["path"], r) if r.get("name_issues") else ""})
     latest = os.path.join(reports, "latest.csv")
     if os.path.lexists(latest):
         os.remove(latest)
@@ -1767,7 +1925,8 @@ def menu(reports="/reports", media="/media"):
         age = scheduler_status(db)
         nsched = len([r for r in schedules(db) if r["enabled"]])
         txt += (f"  ·  [grey62]scheduler[/] {'[green]on[/]' if age is not None and age < 120 else '[red]off[/]'}"
-                f" [grey62]({nsched} active)[/]")
+                f" [grey62]({nsched} active)[/]  ·  [grey62]GPU[/] "
+                + ("[bold #76b900]NVDEC ready[/]" if gpu_available() else "[grey62]none (CPU decoding)[/]"))
         if last:
             txt += f"  ·  [grey62]last run {last['started'].replace('T', ' ')} ({last['mode']}, {last['checked']:,} checked)[/]"
         return txt
@@ -1885,16 +2044,27 @@ def menu(reports="/reports", media="/media"):
                  "3": ("name_issues != '[]'", "mislabelled"), "4": ("status != 'OK'", "all problems")}
         k = Prompt.ask("Show [1] bad  [2] warn  [3] mislabelled  [4] all", choices=list(kinds), default="4")
         where, label = kinds[k]
+        only = {"1": "bad", "2": "warn", "3": "mislabelled", "4": "bad,warn"}[k]
+
+        def rescan():
+            depth = Prompt.ask(f"Recheck these {total:,} file(s): [bold #22d3ee]s[/] sampled or [bold #22d3ee]f[/] full "
+                               "decode (slow on CPU; --gpu on makes it fast but blind to damaged slice data)",
+                               choices=["s", "f"], default="s")
+            start([media, "--only", only] + (["--full"] if depth == "f" else []))
+            Prompt.ask("[grey62]Enter to go back[/]", default="", show_default=False)
         total, off, page = db.count(where), 0, max(c.size.height // 4, 8)
         while True:
             rows = db.rows(where, order="CASE status WHEN 'BAD' THEN 0 WHEN 'WARN' THEN 1 ELSE 2 END, path",
                            limit=page, offset=off)
             c.clear()
             print_problems(c, rows, [media], title_extra=f" ({label})", limit=page, offset=off, total=total)
-            if off + page >= total:
-                Prompt.ask("[grey62]end of list — Enter to go back[/]", default="", show_default=False)
-                return
-            if Prompt.ask("[grey62]Enter = next page, q = back[/]", default="", show_default=False).lower() == "q":
+            last = off + page >= total
+            act = Prompt.ask("[grey62]" + ("end of list" if last else "Enter = next page") + ", r = rescan these, "
+                             "q = back[/]", choices=["", "r", "q"], default="", show_choices=False,
+                             show_default=False).lower()
+            if act == "r":
+                return rescan()
+            if act == "q" or last:
                 return
             off += page
 

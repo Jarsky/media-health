@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+## [3.3.0] - 2026-11-01
+
+### Added
+- Suggested names for mislabelled files, in the problem list and the CSV (`suggested_name`). Claims the streams don't
+  support (HDR, HLG, DV, 10bit, UHD on 8-bit, REMUX on an encode) are dropped. A wrong resolution, video codec or main
+  audio format is replaced with the real one; channel layouts are kept and secondary audio tracks aren't added.
+  Nothing is renamed automatically.
+- `--only bad,warn,mislabelled`: recheck only the files the database already flags (implies `--force`). In the menu,
+  press **r** in the problem list. Flagged files that no longer exist are dropped from the database.
+- GPU status: the dashboard's **Decoder** cell (`NVDEC + CPU`, `CPU`, `CPU (no GPU found)`), a **GPU / CPU** count
+  of decode points, GPU availability in the menu header, and decode counts in the plain status line.
+
+### Changed
+- The dashboard's **Filtered** cell is gone (still recorded in the `runs` table) to make room for the decoder cells.
+
 ## [3.2.0] - 2026-11-01
 
 ### Added

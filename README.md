@@ -24,7 +24,7 @@ Results go into SQLite, so later runs only check new or changed files.
 ## Features
 
 - **Finds broken files.** Unparseable containers, missing video streams, zeroed blocks (failed copies, bad sectors), streams without headers, decoders that time out or run out of memory, and damaged slice data.
-- **Finds mislabelled files.** Resolution, UHD BluRay vs 8-bit encodes, HDR / HLG / Dolby Vision, 10-bit, video codec, REMUX bitrate and audio formats (TrueHD, Atmos, DTS, DD+…).
+- **Finds mislabelled files** and suggests the corrected name. Covers resolution, UHD BluRay vs 8-bit encodes, HDR / HLG / Dolby Vision, 10-bit, video codec, REMUX bitrate and audio formats (TrueHD, Atmos, DTS, DD+…).
 - **Incremental.** Unchanged files are skipped. A renamed, moved or hardlinked copy of a file already checked (e.g. after Radarr/Sonarr imports it) is recognised by fingerprint, and its result is reused.
 - **Fast.** NVIDIA GPU decoding is optional. A stream that floods errors is stopped early, so broken files take seconds instead of minutes.
 - **Interactive.** A live full-screen dashboard, a menu, guided scans, paged problem lists and Tab completion.
@@ -50,6 +50,7 @@ docker exec -it media-health bash
 media-health /media --quick                     # whole library, ~1 s per file
 media-health /media                             # sampled decode check (the default depth)
 media-health /media/tv --newer-than 7d          # what arrived this week
+media-health /media --only bad,warn --full      # full decode of only the files already flagged
 media-health                                    # a scan is running? this takes you back to it
 media-health -h                                 # every option, grouped, with examples
 ```
@@ -64,7 +65,7 @@ With an NVIDIA GPU and the [NVIDIA Container Toolkit](https://docs.nvidia.com/da
 COMPOSE_FILE=docker-compose.yml:docker-compose.gpu.yml
 ```
 
-`--gpu auto` (the default) uses the GPU when one is available.
+`--gpu auto` (the default) uses the GPU when one is available. The menu header shows `GPU NVDEC ready` when the container can see it. During a scan, the dashboard's **Decoder** cell shows what's decoding (`NVDEC + CPU`, `CPU`, `CPU (no GPU found)`), and **GPU / CPU** counts the decode points run on each.
 
 | `--gpu` | Sampled scan | `--full` |
 |---|---|---|
@@ -113,6 +114,11 @@ Depth: `--quick` = probe + zero blocks + name check. The default = + decode samp
 | `REMUX` | not also tagged x264/x265, and at least 25 Mbps (4K) / 12 Mbps (1080p) |
 | `TrueHD` · `Atmos` · `DTS`/`DTS-HD`/`DTS-X` · `DDP`/`EAC3` · `DD`/`AC3` · `AAC` · `FLAC` · `LPCM` | a track of that kind exists |
 
+**Suggested names.** The problem list and the CSV (`suggested_name` column) show the name corrected to match the streams. Nothing is renamed automatically: Radarr/Sonarr own the names, so use the suggestion when you rename the file yourself.
+- Claims the streams don't support are **dropped**: HDR, HLG, DV, 10bit, `UHD` on an 8-bit source, and `REMUX` on an encode or a low bitrate. Nothing like "8bit" or "SDR" is added.
+- A wrong **resolution** or **video codec** is replaced with the real one (`2160p` → `1080p`, `AVC` → `VC-1`).
+- A wrong **audio** format is replaced with the main track (`DTS-HD.MA.5.1` → `TrueHD.5.1`). The channel layout is kept, and secondary tracks (e.g. the AC3 alongside a TrueHD) are never added.
+
 ![Problem files](docs/screenshots/problems.svg)
 
 ## Schedules
@@ -152,6 +158,7 @@ media-health --schedule-run 1        # run now   (--schedule-pause / --schedule-
 | `--min-gb N` | only files at least N GB |
 | `--limit N` | stop after queueing N files |
 | `--force` | ignore the database and rescan everything that matches |
+| `--only KINDS` | recheck only the files the database already flags under PATH: `bad`, `warn` and/or `mislabelled`, comma-separated. Implies `--force`, and drops flagged files that no longer exist. With `--full`, a full decode confirms suspects. In the menu, press **r** in the problem list |
 
 ## Database and reports
 
