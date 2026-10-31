@@ -1,0 +1,11 @@
+# NVIDIA NVDEC decoding. Needs the NVIDIA driver + nvidia-container-toolkit on the host.
+# Enable it in .env:  COMPOSE_FILE=docker-compose.yml:docker-compose.gpu.yml
+services:
+  media-health:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]       # NVDEC needs the "video" driver capability: set in the Dockerfile
